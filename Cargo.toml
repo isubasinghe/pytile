@@ -1,0 +1,37 @@
+[package]
+name = "pytile"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "A Rust learning compiler from a Python subset through MLIR to NVIDIA PTX"
+publish = false
+
+[dependencies]
+anyhow = "1"
+melior = "=0.26.6"
+clap = { version = "4", features = ["derive"] }
+rustpython-parser = "=0.4.0"
+# Embedded Python runtime and its Rust implementation of NumPy.
+# Keep this pair on the Rust 1.95 toolchain; 0.6/0.2 pull in newer Ruff crates.
+# Cargo.lock keeps libc 0.2.183 for RustPython 0.5 POSIX flag compatibility.
+rustpython-vm = "=0.5.0"
+rumpy = "=0.1.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "backend"
+path = "tests/backend.rs"
+
+[profile.dev]
+incremental = true
+
+# Keep full debug information for our code, but avoid generating and linking
+# large debug sections for RustPython, Rumpy and the other dependencies.
+[profile.dev.package."*"]
+debug = 0
+
+# TableGen's C++ shim uses -Werror; Nix's FORTIFY hardening needs optimization.
+[profile.dev.package.tblgen]
+opt-level = 1

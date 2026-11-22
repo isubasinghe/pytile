@@ -1,26 +1,46 @@
-.PHONY: help test lint ast doctor toolchain smoke
+.PHONY: help test test-backend lint ast ir verify-ir doctor toolchain smoke gpu-smoke
 
 help:
-	@echo 'Enter nix develop, then: make ast | test | lint | doctor | smoke'
-	@echo 'make toolchain builds the pinned CUDA Tile tools (first build takes time).'
+	@echo 'nix develop; make ast | ir | verify-ir | test | test-backend | lint | gpu-smoke'
+	@echo 'Compiler: Rust. Input language: Python. Target: NVIDIA sm_75.'
 
 test:
-	python3 -m pytest -q
+	cargo test --locked --all-targets
+
+test-backend:
+	cargo test --locked --test backend -- --ignored
 
 lint:
-	ruff check .
+	cargo fmt --check
+	cargo clippy --locked --all-targets -- -D warnings
+	ruff check scripts examples
 
 ast:
-	python3 -m pytile examples/square_sum.py --dump-ast
+	cargo run --locked --quiet -- ast examples/square_sum.py
+
+ir:
+	mkdir -p build
+	cargo run --locked --quiet --example ir_builder > build/high_level.mlir
+
+verify-ir: ir
+	mlir-opt build/high_level.mlir -o build/high_level.verified.mlir
 
 doctor:
 	python3 scripts/doctor.py
 
 toolchain:
-	nix build --cores 8 .
+	nix build .
 
 smoke:
-	mkdir -p build
-	cuda-tile-opt examples/smoke.mlir -o build/smoke.verified.mlir
-	cuda-tile-translate examples/smoke.mlir --bytecode-version=13.1 --mlir-to-cudatilebc --no-implicit-module -o build/smoke.tilebc
-	test -s build/smoke.tilebc
+	cargo run --locked --quiet -- ptx examples/smoke.mlir -o build/smoke.ptx
+
+gpu-smoke: smoke
+	python3 scripts/run_gpu.py build/smoke.ptx
+
+.PHONY: mnist-demo mnist-test
+
+mnist-demo:
+	python3 examples/mnist_mlp.py
+
+mnist-test:
+	python3 -m unittest discover -s examples -p test_mnist_mlp.py

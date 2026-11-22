@@ -1,38 +1,5 @@
 {
   "nodes": {
-    "cuda-tile": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1794008071,
-        "narHash": "sha256-XBJ4puX2JWrqIi4A9m4iwi2Y1olt8Wxq1ydihGEV6Mo=",
-        "owner": "NVIDIA",
-        "repo": "cuda-tile",
-        "rev": "25732e3308abd43c0aa9007a7b3b012598bbcf15",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NVIDIA",
-        "repo": "cuda-tile",
-        "type": "github"
-      }
-    },
-    "llvm": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1793696853,
-        "narHash": "sha256-tQHm0+S5kvWNBa9aBeuifeR9PDYZltAYRlxk6FJePrs=",
-        "owner": "llvm",
-        "repo": "llvm-project",
-        "rev": "d6a4b2ad0b90fad43565a25f1cbcbac6e6857dde",
-        "type": "github"
-      },
-      "original": {
-        "owner": "llvm",
-        "repo": "llvm-project",
-        "rev": "d6a4b2ad0b90fad43565a25f1cbcbac6e6857dde",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1794872590,
@@ -51,8 +18,6 @@
     },
     "root": {
       "inputs": {
-        "cuda-tile": "cuda-tile",
-        "llvm": "llvm",
         "nixpkgs": "nixpkgs"
       }
     }
