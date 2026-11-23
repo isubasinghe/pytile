@@ -4,10 +4,11 @@ use melior::{
     dialect::{arith, func},
     ir::{
         self,
-        attribute::{StringAttribute, TypeAttribute},
-        operation::OperationLike,
-        r#type::{FunctionType, IntegerType},
-        BlockLike, BlockRef, Module, Operation, Region, RegionLike, Type, Value, ValueLike,
+        attribute::{DenseI32ArrayAttribute, FloatAttribute, StringAttribute, TypeAttribute},
+        operation::{OperationBuilder, OperationLike},
+        r#type::{FunctionType, IntegerType, RankedTensorType},
+        Attribute, BlockLike, BlockRef, Identifier, Module, Operation, Region, RegionLike, Type,
+        Value, ValueLike,
     },
     Context,
 };
@@ -42,6 +43,67 @@ pub enum Typ {
 }
 
 impl Typ {
+    /// Check the supported binary operations and infer their result type.
+    /// Matrix multiplication currently supports rank-2 tensors only; elementwise
+    /// operations require equal shapes, without broadcasting or dtype promotion.
+    fn binary_result(&self, op: ast::Operator, rhs: &Self) -> Result<Self> {
+        match op {
+            ast::Operator::MatMult => {
+                let (
+                    Self::Tensor {
+                        dtype: left_dtype,
+                        shape: left,
+                    },
+                    Self::Tensor {
+                        dtype: right_dtype,
+                        shape: right,
+                    },
+                ) = (self, rhs)
+                else {
+                    bail!("Matrix multiplication requires two matrices, got {self:?} and {rhs:?}");
+                };
+                ensure!(
+                    left.len() == 2 && right.len() == 2,
+                    "Matrix multiplication requires rank-2 tensors, got shapes {left:?} and {right:?}"
+                );
+                ensure!(
+                    left_dtype == right_dtype,
+                    "Matrix multiplication requires matching dtypes, got {left_dtype:?} and {right_dtype:?}"
+                );
+                ensure!(
+                    left[1] == right[0],
+                    "Matrix multiplication inner dimensions must match: {left:?} @ {right:?} ({} != {})",
+                    left[1], right[0]
+                );
+                Ok(Self::Tensor {
+                    dtype: *left_dtype,
+                    shape: vec![left[0], right[1]],
+                })
+            }
+            ast::Operator::Add | ast::Operator::Mult => {
+                match (self, rhs) {
+                    (
+                        Self::Tensor { dtype: left_dtype, shape: left },
+                        Self::Tensor { dtype: right_dtype, shape: right },
+                    ) => {
+                        ensure!(
+                            left_dtype == right_dtype,
+                            "Elementwise {op:?} requires matching dtypes, got {left_dtype:?} and {right_dtype:?}"
+                        );
+                        ensure!(
+                            left == right,
+                            "Elementwise {op:?} requires matching shapes, got {left:?} and {right:?}; broadcasting is not supported yet"
+                        );
+                    }
+                    (Self::Integral, Self::Integral) | (Self::Fractional, Self::Fractional) => {}
+                    _ => bail!("Binary operator {op:?} requires compatible operand types, got {self:?} and {rhs:?}"),
+                }
+                Ok(self.clone())
+            }
+            _ => bail!("Binary operator {op:?} is not supported yet"),
+        }
+    }
+
     /// Inspect metadata only: no tensor data is copied or function body executed.
     pub fn from_runtime(value: &PyObjectRef, vm: &VirtualMachine) -> Result<Self> {
         if let Some(array) = value.downcast_ref::<PyNdArray>() {
@@ -174,6 +236,16 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
 
         let mty = match ty {
             Typ::Integral => IntegerType::new(context, 64).into(),
+            Typ::Tensor {
+                dtype: DType::F32,
+                shape,
+            } => {
+                let dimensions = shape
+                    .iter()
+                    .map(|&dimension| u64::try_from(dimension))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                RankedTensorType::new(&dimensions, Type::float32(context), None).into()
+            }
             _ => bail!("Argument type {ty:?} is not supported yet"),
         };
         Ok(mty)
@@ -198,24 +270,138 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
     ) -> Result<(Typ, Value<'c, 'a>)> {
         let lhs = self.compile_expr(context, &expr.left)?;
         let rhs = self.compile_expr(context, &expr.right)?;
-        if lhs.0 != rhs.0 {
-            bail!("binary operands must have the same type");
-        }
+        let result_ty = lhs.0.binary_result(expr.op, &rhs.0)?;
         let location = ir::Location::unknown(context);
         let operation = match (&lhs.0, expr.op) {
-            (Typ::Unknown, ast::Operator::Add) => bail!("type was unknown"),
-            (Typ::Boolean, ast::Operator::Add) => bail!("adding booleans is not supported"),
             (Typ::Integral, ast::Operator::Add) => arith::addi(lhs.1, rhs.1, location),
             (Typ::Fractional, ast::Operator::Add) => arith::addf(lhs.1, rhs.1, location),
-            (Typ::Unknown, ast::Operator::Mult) => bail!("type was unknown"),
-            (Typ::Boolean, ast::Operator::Mult) => bail!("adding booleans is not supported"),
             (Typ::Integral, ast::Operator::Mult) => arith::muli(lhs.1, rhs.1, location),
             (Typ::Fractional, ast::Operator::Mult) => arith::mulf(lhs.1, rhs.1, location),
+            (
+                Typ::Tensor {
+                    dtype: DType::F32, ..
+                },
+                ast::Operator::Add,
+            ) => arith::addf(lhs.1, rhs.1, location),
+            (
+                Typ::Tensor {
+                    dtype: DType::F32, ..
+                },
+                ast::Operator::Mult,
+            ) => arith::mulf(lhs.1, rhs.1, location),
+            (
+                Typ::Tensor {
+                    dtype: DType::F32, ..
+                },
+                ast::Operator::MatMult,
+            ) => self.emit_matmul(context, lhs.1, rhs.1, &result_ty)?,
             (ty, op) => bail!("binary operator {op:?} is not supported for {ty:?}"),
         };
         let block = self.block_stack.last().context("No active block")?;
         let result = block.append_operation(operation).result(0)?.into();
-        Ok((lhs.0, result))
+        Ok((result_ty, result))
+    }
+
+    fn emit_matmul(
+        &self,
+        context: &'c Context,
+        lhs: Value<'c, 'a>,
+        rhs: Value<'c, 'a>,
+        result_ty: &Typ,
+    ) -> Result<Operation<'c>> {
+        let Typ::Tensor {
+            dtype: DType::F32,
+            shape,
+        } = result_ty
+        else {
+            bail!("Matrix multiplication lowering requires a float32 tensor result");
+        };
+        let dimensions = shape
+            .iter()
+            .map(|&dimension| u64::try_from(dimension))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let element_type = Type::float32(context);
+        let tensor_type: Type = RankedTensorType::new(&dimensions, element_type, None).into();
+        let location = ir::Location::unknown(context);
+        let block = self.block_stack.last().context("No active block")?;
+        let empty = block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[tensor_type])
+                    .build()?,
+            )
+            .result(0)?
+            .into();
+        let zero = block
+            .append_operation(arith::constant(
+                context,
+                FloatAttribute::new(context, element_type, 0.0).into(),
+                location,
+            ))
+            .result(0)?
+            .into();
+
+        // Matmul computes C += A * B, so tensor.empty alone is not a valid
+        // accumulator. Fill it with zero, including when the inner size is zero.
+        let fill_region = Region::new();
+        let fill_block = fill_region.append_block(ir::Block::new(&[
+            (element_type, location),
+            (element_type, location),
+        ]));
+        fill_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[fill_block.argument(0)?.into()])
+                .build()?,
+        );
+        let init = block
+            .append_operation(
+                OperationBuilder::new("linalg.fill", location)
+                    .add_operands(&[zero, empty])
+                    .add_results(&[tensor_type])
+                    .add_attributes(&[(
+                        Identifier::new(context, "operandSegmentSizes"),
+                        DenseI32ArrayAttribute::new(context, &[1, 1]).into(),
+                    )])
+                    .add_regions([fill_region])
+                    .build()?,
+            )
+            .result(0)?
+            .into();
+
+        let region = Region::new();
+        let body = region.append_block(ir::Block::new(&[(element_type, location); 3]));
+        let product = body
+            .append_operation(arith::mulf(
+                body.argument(0)?.into(),
+                body.argument(1)?.into(),
+                location,
+            ))
+            .result(0)?
+            .into();
+        let sum = body
+            .append_operation(arith::addf(body.argument(2)?.into(), product, location))
+            .result(0)?
+            .into();
+        body.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[sum])
+                .build()?,
+        );
+        let indexing_maps = Attribute::parse(context,
+            "[affine_map<(m, n, k) -> (m, k)>, affine_map<(m, n, k) -> (k, n)>, affine_map<(m, n, k) -> (m, n)>]"
+        ).context("Cannot construct matmul indexing maps")?;
+        Ok(OperationBuilder::new("linalg.matmul", location)
+            .add_operands(&[lhs, rhs, init])
+            .add_results(&[tensor_type])
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "operandSegmentSizes"),
+                    DenseI32ArrayAttribute::new(context, &[2, 1]).into(),
+                ),
+                (Identifier::new(context, "indexing_maps"), indexing_maps),
+            ])
+            .add_regions([region])
+            .build()?)
     }
 
     fn compile_expr(
@@ -364,6 +550,101 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
 
 pub fn compile_module<'c>(_context: &'c Context, _module: &ast::Suite) -> Result<Module<'c>> {
     bail!("Compilation requires runtime argument types: construct CompileUnit::from_runtime_args and call unit.compile_module(context, module)")
+}
+
+#[cfg(test)]
+mod binary_type_tests {
+    use super::*;
+
+    fn tensor(shape: &[usize]) -> Typ {
+        Typ::Tensor {
+            dtype: DType::F32,
+            shape: shape.to_vec(),
+        }
+    }
+
+    #[test]
+    fn matmul_infers_output_shape_including_empty_dimensions() {
+        for (left, right, output) in [
+            ([3, 2], [2, 2], [3, 2]),
+            ([2, 3], [3, 4], [2, 4]),
+            ([0, 3], [3, 4], [0, 4]),
+            ([2, 0], [0, 4], [2, 4]),
+        ] {
+            assert_eq!(
+                tensor(&left)
+                    .binary_result(ast::Operator::MatMult, &tensor(&right))
+                    .unwrap(),
+                tensor(&output)
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_rejects_bad_dimensions_ranks_dtypes_and_scalars() {
+        for (left, right, message) in [
+            (
+                tensor(&[3, 2]),
+                tensor(&[3, 2]),
+                "inner dimensions must match",
+            ),
+            (tensor(&[2]), tensor(&[2, 3]), "rank-2"),
+            (tensor(&[1, 3, 2]), tensor(&[2, 4]), "rank-2"),
+            (tensor(&[2, 3]), tensor(&[]), "rank-2"),
+            (
+                tensor(&[2, 3]),
+                Typ::Tensor {
+                    dtype: DType::F64,
+                    shape: vec![3, 4],
+                },
+                "matching dtypes",
+            ),
+            (Typ::Integral, Typ::Integral, "requires two matrices"),
+            (tensor(&[2, 3]), Typ::Fractional, "requires two matrices"),
+        ] {
+            let error = left
+                .binary_result(ast::Operator::MatMult, &right)
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn elementwise_ops_require_equal_shapes_and_dtypes() {
+        for op in [ast::Operator::Add, ast::Operator::Mult] {
+            let matrix = tensor(&[3, 2]);
+            assert_eq!(matrix.binary_result(op, &matrix).unwrap(), matrix);
+            assert!(matrix
+                .binary_result(op, &tensor(&[2, 2]))
+                .unwrap_err()
+                .to_string()
+                .contains("matching shapes"));
+            assert!(matrix
+                .binary_result(op, &tensor(&[2]))
+                .unwrap_err()
+                .to_string()
+                .contains("broadcasting"));
+            let other_dtype = Typ::Tensor {
+                dtype: DType::F64,
+                shape: vec![3, 2],
+            };
+            assert!(matrix
+                .binary_result(op, &other_dtype)
+                .unwrap_err()
+                .to_string()
+                .contains("matching dtypes"));
+            assert_eq!(
+                Typ::Integral.binary_result(op, &Typ::Integral).unwrap(),
+                Typ::Integral
+            );
+            assert_eq!(
+                Typ::Fractional.binary_result(op, &Typ::Fractional).unwrap(),
+                Typ::Fractional
+            );
+            assert!(Typ::Integral.binary_result(op, &Typ::Fractional).is_err());
+            assert!(matrix.binary_result(op, &Typ::Fractional).is_err());
+        }
+    }
 }
 
 #[cfg(test)]

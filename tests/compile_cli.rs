@@ -60,12 +60,58 @@ fn compile_emits_verified_integer_add_without_executing_source() {
     let result = compile(
         &source,
         &output,
-        "(np.zeros(128, dtype=np.float32), np.ones(128, dtype=np.float32))",
+        "(np.zeros(128, dtype=np.float64), np.ones(128, dtype=np.float64))",
         None,
     );
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("is not supported yet"));
     assert_eq!(fs::read_to_string(&output).unwrap(), text);
+}
+
+#[test]
+fn float32_matrix_arguments_and_returns_preserve_shape() {
+    let context = pytile::ir::create_context();
+    let ast = parse_source("def identity(x): return x\n", "identity.py").unwrap();
+    let ast::Stmt::FunctionDef(function) = &ast[0] else {
+        panic!("expected function");
+    };
+    let mut unit = unit_from_expression(function, "(np.zeros((3, 2), dtype=np.float32),)").unwrap();
+    let module = unit.compile_module(&context, &ast).unwrap();
+    assert!(module.as_operation().verify());
+    let text = module.as_operation().to_string();
+    assert!(text.contains("@identity(%arg0: tensor<3x2xf32>) -> tensor<3x2xf32>"));
+    assert!(text.contains("return %arg0 : tensor<3x2xf32>"));
+}
+
+#[test]
+fn matmul_lowers_rectangular_matrices_and_rejects_invalid_shapes() {
+    let context = pytile::ir::create_context();
+    let ast = parse_source("def compute(x, y): return x @ y\n", "matmul.py").unwrap();
+    let ast::Stmt::FunctionDef(function) = &ast[0] else {
+        panic!("expected function");
+    };
+    for (left_shape, right_shape) in [("(3, 2)", "(2, 4)"), ("(3, 0)", "(0, 4)")] {
+        let args = format!(
+            "(np.zeros({left_shape}, dtype=np.float32), np.zeros({right_shape}, dtype=np.float32))"
+        );
+        let mut unit = unit_from_expression(function, &args).unwrap();
+        let module = unit.compile_module(&context, &ast).unwrap();
+        assert!(module.as_operation().verify());
+        let text = module.as_operation().to_string();
+        assert!(text.contains("linalg.fill"));
+        assert!(text.contains("linalg.matmul"));
+        assert!(text.contains("-> tensor<3x4xf32>"));
+    }
+    let mut unit = unit_from_expression(
+        function,
+        "(np.zeros((3, 2), dtype=np.float32), np.zeros((3, 2), dtype=np.float32))",
+    )
+    .unwrap();
+    let error = unit.compile_module(&context, &ast).err().unwrap();
+    assert!(
+        error.to_string().contains("inner dimensions must match"),
+        "{error}"
+    );
 }
 
 #[test]

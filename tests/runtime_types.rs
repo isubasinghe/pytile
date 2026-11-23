@@ -99,7 +99,10 @@ fn seeds_mnist_parameters_and_keeps_them_through_lowering_entry() {
         let before = unit.variables().clone();
         let module = parse_source(source, "mnist_forward.py").unwrap();
         let error = unit.compile_module(&context, &module).err().unwrap();
-        assert!(error.to_string().contains("is not supported yet"));
+        // Tensor arguments now lower, but the np.maximum call is still unsupported.
+        assert!(error
+            .to_string()
+            .contains("this expression isn't supported at the moment"));
         assert_eq!(unit.variables(), &before);
     });
 }

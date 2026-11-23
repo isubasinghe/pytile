@@ -1,23 +1,49 @@
 """Numerical checks; run: python3 -m unittest discover -s examples -p test_mnist_mlp.py."""
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
+from mnist_cpu import initialize, train_epoch
+from mnist_data import load_mnist, one_hot
 from mnist_forward import forward
 from mnist_mlp import (
     cross_entropy,
-    initialize,
-    load_mnist,
     loss_and_gradients,
-    one_hot,
     softmax,
-    train_epoch,
 )
+from run_mnist import main
 
 
 class MnistTests(unittest.TestCase):
+    def test_forward_only_calls_runtime_once_without_training(self):
+        calls = []
+
+        def runtime(x, w1, b1, w2, b2):
+            values = (x, w1, b1, w2, b2)
+            calls.append(values)
+            self.assertEqual(
+                [value.shape for value in values],
+                [(4, 784), (784, 32), (32,), (32, 10), (10,)],
+            )
+            self.assertTrue(all(value.dtype == np.float32 for value in values))
+            return forward(*values)
+
+        output = io.StringIO()
+        with patch("run_mnist.train_epoch", side_effect=AssertionError("must not train")):
+            with contextlib.redirect_stdout(output):
+                main(
+                    ["--forward-only", "--batch-size", "4", "--limit", "16"],
+                    forward_fn=runtime,
+                )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Forward pass: (4, 784) -> (4, 10) | float32", output.getvalue())
+        self.assertNotIn("Epoch", output.getvalue())
+
     def test_one_hot_and_invalid_labels(self):
         labels = np.array([0, 3, 9])
         encoded = one_hot(labels)

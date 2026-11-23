@@ -37,10 +37,16 @@ smoke:
 gpu-smoke: smoke
 	python3 scripts/run_gpu.py build/smoke.ptx
 
-.PHONY: mnist-demo mnist-test
+.PHONY: matrix-demo mnist-demo mnist-forward mnist-test
+
+matrix-demo:
+	python3 examples/matrix_scores.py
 
 mnist-demo:
-	python3 examples/mnist_mlp.py
+	python3 examples/run_mnist.py
+
+mnist-forward:
+	python3 examples/run_mnist.py --forward-only --batch-size 32
 
 mnist-test:
 	python3 -m unittest discover -s examples -p test_mnist_mlp.py

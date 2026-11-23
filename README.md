@@ -3,7 +3,8 @@
 PyTile is a Rust learning compiler for a Python subset. It uses RustPython to
 parse Python and Melior to build MLIR, an intermediate representation.
 
-The frontend compiles scalar integer addition and returns to MLIR. The GPU
+The frontend compiles scalar integer arithmetic, float32 matrix multiplication,
+and matching-shape float32 tensor arithmetic to MLIR. The GPU
 backend converts scalar `i64` functions and standalone `gpu.module` input to
 NVIDIA PTX. Tensor-to-GPU lowering remains an exercise.
 
@@ -37,8 +38,8 @@ diagnostics without an executable build.
 - [src/main.rs](src/main.rs) runs the frontend, checks MLIR, and writes output.
 - [src/backend.rs](src/backend.rs) converts GPU MLIR to PTX with external tools.
 
-Start with two tensor arguments and `return x + y`. Then add assignments and
-multiplication.
+After scalar `square_sum`, use the [matrix scores example](examples/matrix_scores.py)
+below as the next compiler goal.
 
 The `compile` command emits MLIR for the supported subset:
 
@@ -86,8 +87,61 @@ The backend targets `sm_75` / PTX 7.5 for the RTX 2070 SUPER. The check requires
 an accessible NVIDIA driver. It does not require a separate CUDA toolkit.
 Set `PYTILE_CUDA_DRIVER` to override the driver library path.
 
+## Next goal: a tiny matrix classifier
+
+[examples/matrix_scores.py](examples/matrix_scores.py) computes two class scores
+for each of three samples:
+
+```python
+def compute(x, weights, bias):
+    scores = x @ weights
+    return scores + bias
+```
+
+The weights are illustrative, not trained. Higher scores select the class;
+these are not probabilities. Run `make matrix-demo` for the NumPy reference:
+
+```text
+[[ 3. -1.]
+ [ 0.  2.]
+ [ 2.  1.]]
+Predicted classes: [0, 1, 0]
+```
+
+The frontend now supports checkpoints 1–3 below. Tensor execution on the GPU
+is the next compiler goal:
+
+1. **Matrix inputs and returns:** represent `float32` arrays as ranked MLIR
+   types. Start with an identity function, `return x`, preserving shape `[3, 2]`.
+2. **Matrix multiplication:** lower `x @ weights` with shapes `[3, 2] @ [2, 2]`
+   to `[3, 2]`. Expected intermediate: `[[2, -1], [-1, 2], [1, 1]]`.
+   Check the inner dimensions match; unlike addition, operand shapes need not
+   be identical. If using `linalg.matmul`, initialize its accumulator to zero.
+3. **Matrix addition:** add the `[3, 2]` bias elementwise and produce the scores
+   above. This deliberately avoids broadcasting. Verify the emitted MLIR.
+4. **GPU execution:** allocate array and intermediate buffers, lower the matrix
+   operations to GPU kernels, and compare the returned scores with NumPy.
+   The existing scalar GPU adapter/runner needs extension for arrays.
+
+Compile the example to verified MLIR:
+
+```sh
+cargo run --locked -- compile examples/matrix_scores.py \
+  --args '(
+    np.array([[1, 0], [0, 1], [1, 1]], dtype=np.float32),
+    np.array([[2, -1], [-1, 2]], dtype=np.float32),
+    np.array([[1, 0], [1, 0], [1, 0]], dtype=np.float32)
+  )' -o build/matrix_scores.mlir
+```
+
+Keep `argmax` in the reference runner for now. Later goals are a vector bias
+with broadcasting, ReLU, and a second dense layer—the pieces of the MNIST
+forward pass.
+
 ## MNIST example
 
 [examples/MNIST.md](examples/MNIST.md) describes a NumPy `784 → 32 → 10` network.
 Run `make mnist-demo` for synthetic data or `make mnist-test` for numerical checks.
+Use `make mnist-forward` for one inference batch. `examples/run_mnist.py` owns
+the CLI; data loading and CPU training are separate from the model functions.
 The compiler does not yet lower this network to MLIR.
