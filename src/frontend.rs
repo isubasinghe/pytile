@@ -2,7 +2,13 @@
 use anyhow::{bail, ensure, Context as _, Result};
 use melior::{
     dialect::{arith, func},
-    ir::{self, r#type::IntegerType, BlockLike, BlockRef, Module, Region, RegionLike, Type, Value},
+    ir::{
+        self,
+        attribute::{StringAttribute, TypeAttribute},
+        operation::OperationLike,
+        r#type::{FunctionType, IntegerType},
+        BlockLike, BlockRef, Module, Operation, Region, RegionLike, Type, Value, ValueLike,
+    },
     Context,
 };
 use rumpy::{DType, PyNdArray};
@@ -12,7 +18,6 @@ use rustpython_parser::{
 };
 use rustpython_vm::{
     builtins::{PyFloat, PyInt},
-    compiler::ast::NodeKind::ExprName,
     AsObject, PyObjectRef, VirtualMachine,
 };
 use std::collections::HashMap;
@@ -169,8 +174,7 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
 
         let mty = match ty {
             Typ::Integral => IntegerType::new(context, 64).into(),
-            Typ::Unknown => panic!("unknown types are not supported at the moment"),
-            _ => bail!("this type: {:#?}  is not supported", ty),
+            _ => bail!("Argument type {ty:?} is not supported yet"),
         };
         Ok(mty)
     }
@@ -180,11 +184,11 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         _context: &'c Context,
         name: &ast::ExprName,
     ) -> Result<(Typ, Value<'c, 'a>)> {
-        let (ty,val) = match self.variables.get(&name.id.to_string()) {
+        let (ty, val) = match self.variables.get(name.id.as_str()) {
             Some(val) => val.clone(),
-            None => bail!("undefined variable '{}'", name.id)
+            None => bail!("undefined variable '{}'", name.id),
         };
-        let val = val.expect("we expected this to be filled");
+        let val = val.with_context(|| format!("Variable '{}' has no MLIR value yet", name.id))?;
         Ok((ty, val))
     }
     fn compile_binop(
@@ -226,7 +230,8 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         &mut self,
         context: &'c Context,
         stmt_def: &ast::StmtFunctionDef,
-    ) -> Result<()> {
+    ) -> Result<Operation<'c>> {
+        self.return_typ = None;
         let mut margs = vec![];
         for arg in stmt_def.args.posonlyargs.iter().chain(&stmt_def.args.args) {
             let myarg = self.emit_arg(context, arg)?;
@@ -245,27 +250,53 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
             .chain(&stmt_def.args.args)
             .enumerate()
         {
-            let a = &arg.as_arg().arg;
-            let (typ, _) = self.variables.get(&a.to_string()).unwrap().clone();
-            let s = &arg.as_arg().arg.to_string();
-            let block_arg = block.argument(index)?;
-            let val = Some(block_arg.into());
-            self.variables.insert(s.to_string(), (typ, val));
+            let (_, value) = self.variables.get_mut(arg.def.arg.as_str()).unwrap();
+            *value = Some(block.argument(index)?.into());
         }
 
         let block_ref = region.append_block(block);
         self.block_stack.push(block_ref);
 
-        for stmt in &stmt_def.body {
-            self.compile_stmt(context, stmt)?;
+        let result = (|| -> Result<Vec<Type<'c>>> {
+            for stmt in &stmt_def.body {
+                self.compile_stmt(context, stmt)?;
+                if block_ref.terminator().is_some() {
+                    break;
+                }
+            }
+            if block_ref.terminator().is_none() {
+                block_ref.append_operation(func::r#return(&[], loc));
+            }
+            Ok(block_ref
+                .terminator()
+                .context("Missing function terminator")?
+                .operands()
+                .map(|value| value.r#type())
+                .collect())
+        })();
+        // Clear borrowed handles before the region is moved or dropped, including
+        // on errors. The returned operation owns the function body.
+        self.block_stack.pop();
+        for (_, value) in self.variables.values_mut() {
+            *value = None;
         }
-        if let Some(retexpr) = &stmt_def.returns {};
-        Ok(())
+        let results = result?;
+        Ok(func::func(
+            context,
+            StringAttribute::new(context, stmt_def.name.as_str()),
+            TypeAttribute::new(FunctionType::new(context, &margs, &results).into()),
+            region,
+            &[],
+            loc,
+        ))
     }
 
     fn compile_stmtret(&mut self, context: &'c Context, stmt: &ast::StmtReturn) -> Result<()> {
         let block = *self.block_stack.last().context("No active block")?;
-        ensure!(block.terminator().is_none(), "Block already has a terminator");
+        ensure!(
+            block.terminator().is_none(),
+            "Block already has a terminator"
+        );
         let location = ir::Location::unknown(context);
         let (ty, values) = match &stmt.value {
             Some(expr) => {
@@ -281,7 +312,6 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
 
     fn compile_stmt(&mut self, context: &'c Context, stmt: &ast::Stmt) -> Result<()> {
         match stmt {
-            ast::Stmt::FunctionDef(stmt_def) => self.compile_function_def(context, stmt_def),
             ast::Stmt::Return(stmt_def) => self.compile_stmtret(context, stmt_def),
             _ => bail!("not handled, {:#?}", stmt),
         }
@@ -294,15 +324,26 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         context: &'c Context,
         module: &ast::Suite,
     ) -> Result<Module<'c>> {
-        let statement = module
+        let function = module
             .iter()
-            .find(|stmt| {
-                matches!(stmt,
-            ast::Stmt::FunctionDef(function) if function.name.as_str() == self.function_name)
+            .find_map(|stmt| match stmt {
+                ast::Stmt::FunctionDef(function)
+                    if function.name.as_str() == self.function_name =>
+                {
+                    Some(function)
+                }
+                _ => None,
             })
             .with_context(|| format!("Function '{}' not found", self.function_name))?;
-        self.compile_stmt(context, statement)?;
-        bail!("Python-to-MLIR lowering is not implemented yet; runtime parameter types are available in CompileUnit")
+        let module = Module::new(ir::Location::unknown(context));
+        module
+            .body()
+            .append_operation(self.compile_function_def(context, function)?);
+        ensure!(
+            module.as_operation().verify(),
+            "Generated MLIR failed verification"
+        );
+        Ok(module)
     }
 }
 

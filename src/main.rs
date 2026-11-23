@@ -16,7 +16,7 @@ struct Cli {
 enum Commands {
     /// Parse Python in Rust and display its syntax tree.
     Ast { source: PathBuf },
-    /// Emit high-level func/arith MLIR (Python lowering is your exercise).
+    /// Emit func/arith MLIR for the supported Python subset.
     Compile {
         source: PathBuf,
         /// Target function; inferred when the file defines exactly one function.
