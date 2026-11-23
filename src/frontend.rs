@@ -1,13 +1,19 @@
 //! Your exercise: lower a supported Python subset to native MLIR via Melior.
 use anyhow::{bail, ensure, Context as _, Result};
-use melior::{Context, ir::{self, BlockLike, BlockRef, Module, Region, RegionLike, Type, Value, r#type::IntegerType}};
+use melior::{
+    dialect::{arith, func},
+    ir::{self, r#type::IntegerType, BlockLike, BlockRef, Module, Region, RegionLike, Type, Value},
+    Context,
+};
 use rumpy::{DType, PyNdArray};
 use rustpython_parser::{
     ast::{self},
     Parse,
 };
 use rustpython_vm::{
-    AsObject, PyObjectRef, VirtualMachine, builtins::{PyFloat, PyInt}, compiler::ast::NodeKind::ExprName
+    builtins::{PyFloat, PyInt},
+    compiler::ast::NodeKind::ExprName,
+    AsObject, PyObjectRef, VirtualMachine,
 };
 use std::collections::HashMap;
 
@@ -64,7 +70,7 @@ pub struct CompileUnit<'c, 'a> {
     variables: HashMap<String, (Typ, Option<Value<'c, 'a>>)>,
     // The context and owning regions must outlive these borrowed blocks.
     block_stack: Vec<BlockRef<'c, 'a>>,
-    return_typ: Option<Typ>
+    return_typ: Option<Typ>,
 }
 
 impl<'c, 'a> CompileUnit<'c, 'a> {
@@ -112,7 +118,7 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
             function_name: function.name.to_string(),
             variables,
             return_typ: None,
-            block_stack: vec![]
+            block_stack: vec![],
         })
     }
 
@@ -133,7 +139,9 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
     /// Bindings are function-scoped, so entering a nested block does not hide them.
     pub fn get_variable(&self, name: &str) -> Result<Value<'c, 'a>> {
         self.block_stack.last().context("No active block")?;
-        let (_, value) = self.variables.get(name)
+        let (_, value) = self
+            .variables
+            .get(name)
             .with_context(|| format!("Undefined variable '{name}'"))?;
         value.with_context(|| format!("Variable '{name}' has no MLIR value yet"))
     }
@@ -153,43 +161,64 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         Ok(())
     }
 
-    fn emit_arg(
-        &mut self,
-        context: &'c Context,
-        arg: &ast::ArgWithDefault,
-    ) -> Result<Type<'c>> {
+    fn emit_arg(&mut self, context: &'c Context, arg: &ast::ArgWithDefault) -> Result<Type<'c>> {
         let (ty, _value) = self
             .variables
             .get(arg.def.arg.as_str())
             .with_context(|| format!("Missing runtime type for '{}'", arg.def.arg))?;
-        
+
         let mty = match ty {
             Typ::Integral => IntegerType::new(context, 64).into(),
             Typ::Unknown => panic!("unknown types are not supported at the moment"),
-            _ => bail!("this type: {:#?}  is not supported", ty)
+            _ => bail!("this type: {:#?}  is not supported", ty),
         };
         Ok(mty)
     }
 
-    fn compile_name(&mut self, context: &'c Context, name: &ast::ExprName) -> Result<(Typ, Value<'c, 'a>)> {
-        todo!();
+    fn compile_name(
+        &mut self,
+        _context: &'c Context,
+        name: &ast::ExprName,
+    ) -> Result<(Typ, Value<'c, 'a>)> {
+        let (ty,val) = match self.variables.get(&name.id.to_string()) {
+            Some(val) => val.clone(),
+            None => bail!("undefined variable '{}'", name.id)
+        };
+        let val = val.expect("we expected this to be filled");
+        Ok((ty, val))
     }
-    fn compile_binop(&mut self, context: &'c Context, expr: &ast::ExprBinOp) -> Result<(Typ, Value<'c, 'a>)> {
-        println!("expr: {:#?}", expr);
+    fn compile_binop(
+        &mut self,
+        context: &'c Context,
+        expr: &ast::ExprBinOp,
+    ) -> Result<(Typ, Value<'c, 'a>)> {
         let lhs = self.compile_expr(context, &expr.left)?;
         let rhs = self.compile_expr(context, &expr.right)?;
-        match expr.op {
-            ast::Operator::Add => panic!("not implemented"),
-            _ => panic!("not implemented")
+        if lhs.0 != rhs.0 {
+            bail!("binary operands must have the same type");
+        }
+        let location = ir::Location::unknown(context);
+        let operation = match (&lhs.0, expr.op) {
+            (Typ::Unknown, ast::Operator::Add) => bail!("type was unknown"),
+            (Typ::Boolean, ast::Operator::Add) => bail!("adding booleans is not supported"),
+            (Typ::Integral, ast::Operator::Add) => arith::addi(lhs.1, rhs.1, location),
+            (Typ::Fractional, ast::Operator::Add) => arith::addf(lhs.1, rhs.1, location),
+            (ty, op) => bail!("binary operator {op:?} is not supported for {ty:?}"),
         };
-        todo!()
+        let block = self.block_stack.last().context("No active block")?;
+        let result = block.append_operation(operation).result(0)?.into();
+        Ok((lhs.0, result))
     }
 
-    fn compile_expr(&mut self, context: &'c Context, expr: &ast::Expr) -> Result<(Typ, Value<'c, 'a>)>{ 
+    fn compile_expr(
+        &mut self,
+        context: &'c Context,
+        expr: &ast::Expr,
+    ) -> Result<(Typ, Value<'c, 'a>)> {
         match expr {
             ast::Expr::BinOp(binop) => self.compile_binop(context, binop),
             ast::Expr::Name(name) => self.compile_name(context, name),
-            _ => bail!("this expression isn't supported at the moment: {:#?}", expr)
+            _ => bail!("this expression isn't supported at the moment: {:#?}", expr),
         }
     }
 
@@ -204,14 +233,20 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
             margs.push(myarg);
         }
         let loc = ir::Location::unknown(context);
-        let block_args: Vec<(Type<'_>, ir::Location)>= margs.iter().map(|a| { (*a, loc) }).collect();
+        let block_args: Vec<(Type<'_>, ir::Location)> = margs.iter().map(|a| (*a, loc)).collect();
 
         let region = Region::new();
         let block = ir::Block::new(&block_args);
 
-        for (index, arg) in stmt_def.args.posonlyargs.iter().chain(&stmt_def.args.args).enumerate() {
+        for (index, arg) in stmt_def
+            .args
+            .posonlyargs
+            .iter()
+            .chain(&stmt_def.args.args)
+            .enumerate()
+        {
             let a = &arg.as_arg().arg;
-            let (typ, _)  = self.variables.get(&a.to_string()).unwrap().clone();
+            let (typ, _) = self.variables.get(&a.to_string()).unwrap().clone();
             let s = &arg.as_arg().arg.to_string();
             let block_arg = block.argument(index)?;
             let val = Some(block_arg.into());
@@ -224,17 +259,23 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         for stmt in &stmt_def.body {
             self.compile_stmt(context, stmt)?;
         }
-        if let Some(retexpr) = &stmt_def.returns {
-        };
+        if let Some(retexpr) = &stmt_def.returns {};
         Ok(())
     }
 
     fn compile_stmtret(&mut self, context: &'c Context, stmt: &ast::StmtReturn) -> Result<()> {
-        if stmt.value.is_none() {
-            return Ok(());
-        }
-        let expr = stmt.value.as_ref().unwrap();
-        self.compile_expr(context, expr)?;
+        let block = *self.block_stack.last().context("No active block")?;
+        ensure!(block.terminator().is_none(), "Block already has a terminator");
+        let location = ir::Location::unknown(context);
+        let (ty, values) = match &stmt.value {
+            Some(expr) => {
+                let (ty, value) = self.compile_expr(context, expr)?;
+                (Some(ty), vec![value])
+            }
+            None => (None, vec![]),
+        };
+        block.append_operation(func::r#return(&values, location));
+        self.return_typ = ty;
         Ok(())
     }
 
@@ -270,6 +311,88 @@ pub fn compile_module<'c>(_context: &'c Context, _module: &ast::Suite) -> Result
 }
 
 #[cfg(test)]
+mod return_tests {
+    use super::*;
+    use melior::ir::{
+        attribute::{StringAttribute, TypeAttribute},
+        operation::OperationLike,
+        r#type::FunctionType,
+    };
+
+    #[test]
+    fn return_statements_produce_valid_function_bodies() {
+        for (source, has_value) in [("return x + x", true), ("return", false)] {
+            let context = crate::ir::create_context();
+            let location = ir::Location::unknown(&context);
+            let int_type: Type = IntegerType::new(&context, 64).into();
+            let region = Region::new();
+            let block = region.append_block(ir::Block::new(&[(int_type, location)]));
+            let argument = block.argument(0).unwrap().into();
+            let mut unit = CompileUnit {
+                function_name: "test".into(),
+                variables: HashMap::from([("x".into(), (Typ::Integral, Some(argument)))]),
+                block_stack: vec![block],
+                return_typ: None,
+            };
+            let suite = parse_source(source, "test.py").unwrap();
+            let ast::Stmt::Return(stmt) = &suite[0] else {
+                panic!("expected return statement");
+            };
+            unit.compile_stmtret(&context, stmt).unwrap();
+            assert_eq!(unit.return_typ, has_value.then_some(Typ::Integral));
+            assert!(unit
+                .compile_stmtret(&context, stmt)
+                .unwrap_err()
+                .to_string()
+                .contains("already has a terminator"));
+            drop(unit);
+
+            let results = if has_value { vec![int_type] } else { vec![] };
+            let module = Module::new(location);
+            module.body().append_operation(func::func(
+                &context,
+                StringAttribute::new(&context, "test"),
+                TypeAttribute::new(FunctionType::new(&context, &[int_type], &results).into()),
+                region,
+                &[],
+                location,
+            ));
+            assert!(module.as_operation().verify());
+        }
+    }
+
+    #[test]
+    fn return_errors_do_not_emit_a_terminator() {
+        let context = crate::ir::create_context();
+        let region = Region::new();
+        let block = region.append_block(ir::Block::new(&[]));
+        let mut unit = CompileUnit {
+            function_name: "test".into(),
+            variables: HashMap::new(),
+            block_stack: vec![],
+            return_typ: None,
+        };
+        let suite = parse_source("return missing", "test.py").unwrap();
+        let ast::Stmt::Return(stmt) = &suite[0] else {
+            panic!("expected return statement");
+        };
+        assert!(unit
+            .compile_stmtret(&context, stmt)
+            .unwrap_err()
+            .to_string()
+            .contains("No active block"));
+        unit.block_stack.push(block);
+        assert!(unit
+            .compile_stmtret(&context, stmt)
+            .unwrap_err()
+            .to_string()
+            .contains("undefined variable"));
+        assert!(block.terminator().is_none());
+        assert_eq!(unit.return_typ, None);
+    }
+}
+
+#[cfg(test)]
 mod variable_helpers_tests {
     use super::*;
     use melior::{dialect::arith, ir::BlockLike};
@@ -286,8 +409,10 @@ mod variable_helpers_tests {
         let argument: Value = block.argument(0).unwrap().into();
         let flag: Value = block.argument(1).unwrap().into();
         let mut unit = CompileUnit {
-            function_name: "test".into(), variables: HashMap::new(),
-            block_stack: vec![block], return_typ: None,
+            function_name: "test".into(),
+            variables: HashMap::new(),
+            block_stack: vec![block],
+            return_typ: None,
         };
         unit.set_variable("x", Typ::Integral, argument).unwrap();
         let x = unit.get_variable("x").unwrap();
@@ -308,21 +433,35 @@ mod variable_helpers_tests {
     fn reports_missing_blocks_names_and_unlowered_values() {
         let context = crate::ir::create_context();
         let region = Region::new();
-        let block = region.append_block(ir::Block::new(&[
-            (IntegerType::new(&context, 64).into(), ir::Location::unknown(&context)),
-        ]));
+        let block = region.append_block(ir::Block::new(&[(
+            IntegerType::new(&context, 64).into(),
+            ir::Location::unknown(&context),
+        )]));
         let value = block.argument(0).unwrap().into();
         let mut unit = CompileUnit {
             function_name: "test".into(),
             variables: HashMap::from([("x".into(), (Typ::Integral, None))]),
-            block_stack: vec![], return_typ: None,
+            block_stack: vec![],
+            return_typ: None,
         };
-        assert!(unit.get_variable("x").unwrap_err().to_string().contains("No active block"));
+        assert!(unit
+            .get_variable("x")
+            .unwrap_err()
+            .to_string()
+            .contains("No active block"));
         assert!(unit.set_variable("x", Typ::Integral, value).is_err());
         assert_eq!(unit.variable_value("x"), None);
         unit.block_stack.push(block);
-        assert!(unit.get_variable("missing").unwrap_err().to_string().contains("Undefined variable"));
-        assert!(unit.get_variable("x").unwrap_err().to_string().contains("no MLIR value yet"));
+        assert!(unit
+            .get_variable("missing")
+            .unwrap_err()
+            .to_string()
+            .contains("Undefined variable"));
+        assert!(unit
+            .get_variable("x")
+            .unwrap_err()
+            .to_string()
+            .contains("no MLIR value yet"));
         unit.set_variable("x", Typ::Integral, value).unwrap();
         assert_eq!(unit.get_variable("x").unwrap(), value);
     }
