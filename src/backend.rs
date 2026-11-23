@@ -1,4 +1,6 @@
-//! Invoke the standard MLIR and LLVM tools. No Python compiler or MLIR FFI needed.
+//! Adapt scalar MLIR to GPU kernels and invoke the standard MLIR/LLVM tools.
+
+mod scalar;
 
 use std::{fs, path::Path, process::Command};
 
@@ -26,10 +28,11 @@ pub fn compile_ptx(source: &Path, output: &Path) -> Result<()> {
         .canonicalize()?
         .join(output.file_name().context("Missing output filename")?);
     let verified = output.with_extension("verified.mlir");
+    let gpu = output.with_extension("gpu.mlir");
     let lowered = output.with_extension("nvvm.mlir");
     let device = output.with_extension("device.mlir");
     let llvm_ir = output.with_extension("ll");
-    let artifacts = [&output, &verified, &lowered, &device, &llvm_ir];
+    let artifacts = [&output, &verified, &gpu, &lowered, &device, &llvm_ir];
     for (index, path) in artifacts.iter().enumerate() {
         let resolved = path.canonicalize().unwrap_or_else(|_| (*path).clone());
         ensure!(resolved != source, "Input MLIR overlaps an output artifact");
@@ -49,17 +52,18 @@ pub fn compile_ptx(source: &Path, output: &Path) -> Result<()> {
         .arg(&source)
         .args(["--no-implicit-module", "-o"])
         .arg(&verified))?;
-    ensure!(
-        fs::read_to_string(&verified)?
-            .trim_start()
-            .starts_with("gpu.module "),
-        "Expected one standalone gpu.module without a builtin.module wrapper"
-    );
+    let text = fs::read_to_string(&verified)?;
+    let device_input = if text.trim_start().starts_with("gpu.module ") {
+        &verified
+    } else {
+        fs::write(&gpu, scalar::wrap(&text)?)?;
+        &gpu
+    };
 
     // LLVM 21 requires a parent builtin.module during GPU data-layout lookup.
-    let pipeline = "builtin.module(gpu.module(convert-gpu-to-nvvm{use-bare-ptr-memref-call-conv=true},reconcile-unrealized-casts))";
+    let pipeline = "builtin.module(gpu.module(convert-gpu-to-nvvm{use-bare-ptr-memref-call-conv=true}),convert-func-to-llvm,reconcile-unrealized-casts)";
     run(Command::new("mlir-opt")
-        .arg(&verified)
+        .arg(device_input)
         .arg(format!("--pass-pipeline={pipeline}"))
         .arg("-o")
         .arg(&lowered))?;

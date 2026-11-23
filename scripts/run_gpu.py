@@ -9,8 +9,6 @@ import ctypes as ct
 import os
 from pathlib import Path
 
-import numpy as np
-
 COUNT = 128
 
 
@@ -62,6 +60,8 @@ class Driver:
 
 
 def run(ptx: Path, device_index: int = 0):
+    import numpy as np
+
     driver = Driver()
     driver.call("cuInit", 0)
     device = ct.c_int()

@@ -17,6 +17,30 @@ fn reference_kernel_compiles_to_sm75() {
 
 #[test]
 #[ignore = "requires MLIR/LLVM tools; run make test-backend in the full nix shell"]
+fn scalar_add_compiles_to_cuda_kernel() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("input.mlir");
+    let output = dir.path().join("add.ptx");
+    fs::write(
+        &source,
+        "module { func.func @compute(%x: i64, %y: i64) -> i64 {
+        %sum = arith.addi %x, %y : i64
+        return %sum : i64
+    } }",
+    )
+    .unwrap();
+    compile_ptx(&source, &output).unwrap();
+    let ptx = fs::read_to_string(output).unwrap();
+    assert!(ptx.contains(".target sm_75"));
+    assert!(ptx.contains(".entry compute_kernel("));
+    assert!(ptx.contains("add.s64"));
+    // Bare pointers may have only byte alignment, so LLVM can split an i64
+    // result into two 32-bit stores.
+    assert!(ptx.contains("st.b32") || ptx.contains("st.u64") || ptx.contains("st.global.u64"));
+}
+
+#[test]
+#[ignore = "requires MLIR/LLVM tools; run make test-backend in the full nix shell"]
 fn invalid_ir_fails_without_ptx() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("invalid.mlir");

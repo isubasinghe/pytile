@@ -3,8 +3,9 @@
 PyTile is a Rust learning compiler for a Python subset. It uses RustPython to
 parse Python and Melior to build MLIR, an intermediate representation.
 
-Python-to-MLIR and tensor-to-GPU lowering remain exercises. The existing GPU
-backend converts standalone `gpu.module` input to NVIDIA PTX.
+The frontend compiles scalar integer addition and returns to MLIR. The GPU
+backend converts scalar `i64` functions and standalone `gpu.module` input to
+NVIDIA PTX. Tensor-to-GPU lowering remains an exercise.
 
 ## Start
 
@@ -39,11 +40,30 @@ diagnostics without an executable build.
 Start with two tensor arguments and `return x + y`. Then add assignments and
 multiplication.
 
-The `compile` command enters the unfinished lowering code:
+The `compile` command emits MLIR for the supported subset:
 
 ```sh
 cargo run --locked -- compile examples/add.py --args '(2, 3)' -o build/add.mlir
 ```
+
+Compile that function to CUDA PTX and run it on the GPU:
+
+```sh
+cargo run --locked -- ptx build/add.mlir -o build/add.ptx
+python3 scripts/run_scalar_gpu.py build/add.ptx --args 2 3 --expect 5
+```
+
+The second command prints `5`. The backend adds a `compute_kernel` entry point
+that takes the scalar arguments followed by a device pointer to one `i64`
+result. Launch it with exactly one block and one thread. For another function
+name, pass `--kernel <name>_kernel` to the runner. The number and order of
+`--args` must match the compiled function. Scalar GPU lowering currently accepts
+one function with `i64` parameters and one `i64` result; arithmetic uses fixed
+64-bit integers, not Python's arbitrary-precision integers.
+
+The compiler's sample arguments select types; the runner supplies the actual
+values. PTX compilation requires the Nix toolchain, while execution additionally
+requires an accessible NVIDIA driver. No separate CUDA toolkit is needed.
 
 `--args` evaluates a Python tuple with Rumpy available as `np`. The compiler
 does not execute the source module or target function. Supply every argument
