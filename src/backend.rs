@@ -1,6 +1,7 @@
 //! Adapt scalar MLIR to GPU kernels and invoke the standard MLIR/LLVM tools.
 
 mod scalar;
+mod tensor;
 
 use std::{fs, path::Path, process::Command};
 
@@ -32,7 +33,16 @@ pub fn compile_ptx(source: &Path, output: &Path) -> Result<()> {
     let lowered = output.with_extension("nvvm.mlir");
     let device = output.with_extension("device.mlir");
     let llvm_ir = output.with_extension("ll");
-    let artifacts = [&output, &verified, &gpu, &lowered, &device, &llvm_ir];
+    let manifest_path = output.with_extension("json");
+    let artifacts = [
+        &output,
+        &verified,
+        &gpu,
+        &lowered,
+        &device,
+        &llvm_ir,
+        &manifest_path,
+    ];
     for (index, path) in artifacts.iter().enumerate() {
         let resolved = path.canonicalize().unwrap_or_else(|_| (*path).clone());
         ensure!(resolved != source, "Input MLIR overlaps an output artifact");
@@ -53,15 +63,22 @@ pub fn compile_ptx(source: &Path, output: &Path) -> Result<()> {
         .args(["--no-implicit-module", "-o"])
         .arg(&verified))?;
     let text = fs::read_to_string(&verified)?;
+    let mut manifest = None;
     let device_input = if text.trim_start().starts_with("gpu.module ") {
         &verified
     } else {
-        fs::write(&gpu, scalar::wrap(&text)?)?;
+        let gpu_source = if let Some(program) = tensor::lower(&text)? {
+            manifest = Some(program.manifest);
+            program.gpu
+        } else {
+            scalar::wrap(&text)?
+        };
+        fs::write(&gpu, gpu_source)?;
         &gpu
     };
 
     // LLVM 21 requires a parent builtin.module during GPU data-layout lookup.
-    let pipeline = "builtin.module(gpu.module(convert-gpu-to-nvvm{use-bare-ptr-memref-call-conv=true}),convert-func-to-llvm,reconcile-unrealized-casts)";
+    let pipeline = "builtin.module(arith-expand,gpu.module(convert-scf-to-cf,convert-gpu-to-nvvm{use-bare-ptr-memref-call-conv=true}),convert-func-to-llvm,reconcile-unrealized-casts)";
     run(Command::new("mlir-opt")
         .arg(device_input)
         .arg(format!("--pass-pipeline={pipeline}"))
@@ -95,5 +112,14 @@ pub fn compile_ptx(source: &Path, output: &Path) -> Result<()> {
         .arg(&llvm_ir)
         .arg("-o")
         .arg(&output))?;
+    if let Some(mut manifest) = manifest {
+        let fingerprint = fs::read(&output)?
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        manifest.ptx_fnv1a64 = format!("{fingerprint:016x}");
+        fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    }
     Ok(())
 }

@@ -41,6 +41,40 @@ fn scalar_add_compiles_to_cuda_kernel() {
 
 #[test]
 #[ignore = "requires MLIR/LLVM tools; run make test-backend in the full nix shell"]
+fn mnist_forward_compiles_to_ordered_gpu_kernels() {
+    use pytile::{frontend::parse_source, runtime::unit_from_expression};
+    use rustpython_parser::ast;
+
+    let context = pytile::ir::create_context();
+    let ast = parse_source(include_str!("../examples/mnist_forward.py"), "mnist.py").unwrap();
+    let function = ast
+        .iter()
+        .find_map(|stmt| match stmt {
+            ast::Stmt::FunctionDef(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    let mut unit = unit_from_expression(function,
+        "tuple(np.zeros(shape, dtype=np.float32) for shape in [(3, 784), (784, 32), (32,), (32, 10), (10,)])").unwrap();
+    let module = unit.compile_module(&context, &ast).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("mnist.mlir");
+    let output = dir.path().join("mnist.ptx");
+    fs::write(&source, module.as_operation().to_string()).unwrap();
+    compile_ptx(&source, &output).unwrap();
+    let ptx = fs::read_to_string(&output).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(output.with_extension("json")).unwrap()).unwrap();
+    assert_eq!(manifest["inputs"], serde_json::json!([0, 1, 2, 3, 4]));
+    let output_id = manifest["output"].as_u64().unwrap() as usize;
+    assert_eq!(manifest["buffers"][output_id], serde_json::json!([3, 10]));
+    assert_eq!(manifest["kernels"].as_array().unwrap().len(), 7);
+    assert_eq!(ptx.matches(".entry ").count(), 7);
+    assert_eq!(manifest["ptx_fnv1a64"].as_str().unwrap().len(), 16);
+}
+
+#[test]
+#[ignore = "requires MLIR/LLVM tools; run make test-backend in the full nix shell"]
 fn invalid_ir_fails_without_ptx() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("invalid.mlir");

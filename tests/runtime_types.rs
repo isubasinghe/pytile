@@ -1,3 +1,4 @@
+use melior::ir::operation::OperationLike;
 use pytile::frontend::{parse_source, CompileUnit, Typ};
 use rumpy::DType;
 use rustpython_parser::ast;
@@ -98,12 +99,12 @@ fn seeds_mnist_parameters_and_keeps_them_through_lowering_entry() {
         }
         let before = unit.variables().clone();
         let module = parse_source(source, "mnist_forward.py").unwrap();
-        let error = unit.compile_module(&context, &module).err().unwrap();
-        // Tensor arguments now lower, but the np.maximum call is still unsupported.
-        assert!(error
-            .to_string()
-            .contains("this expression isn't supported at the moment"));
-        assert_eq!(unit.variables(), &before);
+        let mlir = unit.compile_module(&context, &module).unwrap();
+        assert!(mlir.as_operation().verify());
+        for (name, binding) in &before {
+            assert_eq!(unit.variables().get(name), Some(binding));
+        }
+        assert!(unit.variables().values().all(|(_, value)| value.is_none()));
     });
 }
 

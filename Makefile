@@ -37,7 +37,7 @@ smoke:
 gpu-smoke: smoke
 	python3 scripts/run_gpu.py build/smoke.ptx
 
-.PHONY: matrix-demo mnist-demo mnist-forward mnist-test
+.PHONY: matrix-demo mnist-demo mnist-forward mnist-compile mnist-gpu mnist-test
 
 matrix-demo:
 	python3 examples/matrix_scores.py
@@ -47,6 +47,15 @@ mnist-demo:
 
 mnist-forward:
 	python3 examples/run_mnist.py --forward-only --batch-size 32
+
+mnist-compile:
+	cargo run --locked -- compile examples/mnist_forward.py \
+		--args 'tuple(np.zeros(shape, dtype=np.float32) for shape in [(32, 784), (784, 32), (32,), (32, 10), (10,)])' \
+		-o build/mnist_forward.mlir
+
+mnist-gpu: mnist-compile
+	cargo run --locked -- ptx build/mnist_forward.mlir -o build/mnist_forward.ptx
+	python3 scripts/run_mnist_gpu.py build/mnist_forward.ptx
 
 mnist-test:
 	python3 -m unittest discover -s examples -p test_mnist_mlp.py

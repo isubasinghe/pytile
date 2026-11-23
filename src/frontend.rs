@@ -43,9 +43,62 @@ pub enum Typ {
 }
 
 impl Typ {
+    fn elementwise_result(&self, op: &str, rhs: &Self) -> Result<Self> {
+        match (self, rhs) {
+            (
+                Self::Tensor {
+                    dtype: left_dtype,
+                    shape: left,
+                },
+                Self::Tensor {
+                    dtype: right_dtype,
+                    shape: right,
+                },
+            ) => {
+                ensure!(left_dtype == right_dtype,
+                    "Elementwise {op} requires matching dtypes, got {left_dtype:?} and {right_dtype:?}");
+                let rank = left.len().max(right.len());
+                let mut shape = vec![1; rank];
+                for offset in 0..rank {
+                    let l = left.iter().rev().nth(offset).copied().unwrap_or(1);
+                    let r = right.iter().rev().nth(offset).copied().unwrap_or(1);
+                    ensure!(
+                        l == r || l == 1 || r == 1,
+                        "Cannot broadcast shapes {left:?} and {right:?} for {op}"
+                    );
+                    shape[rank - 1 - offset] = if l == 1 { r } else { l };
+                }
+                Ok(Self::Tensor {
+                    dtype: *left_dtype,
+                    shape,
+                })
+            }
+            // Python float scalars take the array's element type in the
+            // supported float32 tensor subset; standalone floats remain f64.
+            (
+                tensor @ Self::Tensor {
+                    dtype: DType::F32, ..
+                },
+                Self::Fractional,
+            )
+            | (
+                Self::Fractional,
+                tensor @ Self::Tensor {
+                    dtype: DType::F32, ..
+                },
+            ) => Ok(tensor.clone()),
+            (Self::Integral, Self::Integral) | (Self::Fractional, Self::Fractional) => {
+                Ok(self.clone())
+            }
+            _ => bail!(
+                "Elementwise {op} requires compatible operand types, got {self:?} and {rhs:?}"
+            ),
+        }
+    }
+
     /// Check the supported binary operations and infer their result type.
-    /// Matrix multiplication currently supports rank-2 tensors only; elementwise
-    /// operations require equal shapes, without broadcasting or dtype promotion.
+    /// Matrix multiplication supports rank-2 tensors. Elementwise operations
+    /// broadcast trailing dimensions without promoting tensor dtypes.
     fn binary_result(&self, op: ast::Operator, rhs: &Self) -> Result<Self> {
         match op {
             ast::Operator::MatMult => {
@@ -81,24 +134,7 @@ impl Typ {
                 })
             }
             ast::Operator::Add | ast::Operator::Mult => {
-                match (self, rhs) {
-                    (
-                        Self::Tensor { dtype: left_dtype, shape: left },
-                        Self::Tensor { dtype: right_dtype, shape: right },
-                    ) => {
-                        ensure!(
-                            left_dtype == right_dtype,
-                            "Elementwise {op:?} requires matching dtypes, got {left_dtype:?} and {right_dtype:?}"
-                        );
-                        ensure!(
-                            left == right,
-                            "Elementwise {op:?} requires matching shapes, got {left:?} and {right:?}; broadcasting is not supported yet"
-                        );
-                    }
-                    (Self::Integral, Self::Integral) | (Self::Fractional, Self::Fractional) => {}
-                    _ => bail!("Binary operator {op:?} requires compatible operand types, got {self:?} and {rhs:?}"),
-                }
-                Ok(self.clone())
+                self.elementwise_result(&format!("{op:?}"), rhs)
             }
             _ => bail!("Binary operator {op:?} is not supported yet"),
         }
@@ -236,6 +272,7 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
 
         let mty = match ty {
             Typ::Integral => IntegerType::new(context, 64).into(),
+            Typ::Fractional => Type::float64(context),
             Typ::Tensor {
                 dtype: DType::F32,
                 shape,
@@ -272,7 +309,7 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         let rhs = self.compile_expr(context, &expr.right)?;
         let result_ty = lhs.0.binary_result(expr.op, &rhs.0)?;
         let location = ir::Location::unknown(context);
-        let operation = match (&lhs.0, expr.op) {
+        let operation = match (&result_ty, expr.op) {
             (Typ::Integral, ast::Operator::Add) => arith::addi(lhs.1, rhs.1, location),
             (Typ::Fractional, ast::Operator::Add) => arith::addf(lhs.1, rhs.1, location),
             (Typ::Integral, ast::Operator::Mult) => arith::muli(lhs.1, rhs.1, location),
@@ -282,13 +319,13 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
                     dtype: DType::F32, ..
                 },
                 ast::Operator::Add,
-            ) => arith::addf(lhs.1, rhs.1, location),
+            ) => self.emit_elementwise(context, &lhs, &rhs, &result_ty, "arith.addf")?,
             (
                 Typ::Tensor {
                     dtype: DType::F32, ..
                 },
                 ast::Operator::Mult,
-            ) => arith::mulf(lhs.1, rhs.1, location),
+            ) => self.emit_elementwise(context, &lhs, &rhs, &result_ty, "arith.mulf")?,
             (
                 Typ::Tensor {
                     dtype: DType::F32, ..
@@ -300,6 +337,124 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         let block = self.block_stack.last().context("No active block")?;
         let result = block.append_operation(operation).result(0)?.into();
         Ok((result_ty, result))
+    }
+
+    /// Emit a pointwise operation with NumPy-style trailing-dimension broadcast.
+    fn emit_elementwise(
+        &self,
+        context: &'c Context,
+        lhs: &(Typ, Value<'c, 'a>),
+        rhs: &(Typ, Value<'c, 'a>),
+        result_ty: &Typ,
+        scalar_op: &str,
+    ) -> Result<Operation<'c>> {
+        let Typ::Tensor {
+            dtype: DType::F32,
+            shape,
+        } = result_ty
+        else {
+            bail!("Tensor elementwise lowering requires a float32 result");
+        };
+        let location = ir::Location::unknown(context);
+        let element_type = Type::float32(context);
+        let dimensions = shape
+            .iter()
+            .map(|&d| u64::try_from(d))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let tensor_type: Type = RankedTensorType::new(&dimensions, element_type, None).into();
+        let block = self.block_stack.last().context("No active block")?;
+        let empty = block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[tensor_type])
+                    .build()?,
+            )
+            .result(0)?
+            .into();
+        let dims = (0..shape.len())
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut maps = Vec::new();
+        let mut operands = Vec::new();
+        for (ty, value) in [lhs, rhs] {
+            let (indices, value) = match ty {
+                Typ::Tensor {
+                    shape: input_shape, ..
+                } => {
+                    let offset = shape.len() - input_shape.len();
+                    let indices = input_shape
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &size)| {
+                            if size == 1 {
+                                "0".into()
+                            } else {
+                                format!("d{}", offset + i)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (indices, *value)
+                }
+                Typ::Fractional => {
+                    let narrowed = block
+                        .append_operation(
+                            OperationBuilder::new("arith.truncf", location)
+                                .add_operands(&[*value])
+                                .add_results(&[element_type])
+                                .build()?,
+                        )
+                        .result(0)?
+                        .into();
+                    (String::new(), narrowed)
+                }
+                _ => bail!("Unsupported elementwise operand: {ty:?}"),
+            };
+            maps.push(format!("affine_map<({dims}) -> ({indices})>"));
+            operands.push(value);
+        }
+        maps.push(format!("affine_map<({dims}) -> ({dims})>"));
+        operands.push(empty);
+        let maps = Attribute::parse(context, &format!("[{}]", maps.join(", ")))
+            .context("Cannot construct broadcast indexing maps")?;
+        let iterators = Attribute::parse(
+            context,
+            &format!(
+                "[{}]",
+                vec!["#linalg.iterator_type<parallel>"; shape.len()].join(", ")
+            ),
+        )
+        .context("Cannot construct parallel iterators")?;
+        let region = Region::new();
+        let body = region.append_block(ir::Block::new(&[(element_type, location); 3]));
+        let value = body
+            .append_operation(
+                OperationBuilder::new(scalar_op, location)
+                    .add_operands(&[body.argument(0)?.into(), body.argument(1)?.into()])
+                    .add_results(&[element_type])
+                    .build()?,
+            )
+            .result(0)?
+            .into();
+        body.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[value])
+                .build()?,
+        );
+        Ok(OperationBuilder::new("linalg.generic", location)
+            .add_operands(&operands)
+            .add_results(&[tensor_type])
+            .add_attributes(&[
+                (Identifier::new(context, "indexing_maps"), maps),
+                (Identifier::new(context, "iterator_types"), iterators),
+                (
+                    Identifier::new(context, "operandSegmentSizes"),
+                    DenseI32ArrayAttribute::new(context, &[2, 1]).into(),
+                ),
+            ])
+            .add_regions([region])
+            .build()?)
     }
 
     fn emit_matmul(
@@ -404,6 +559,51 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
             .build()?)
     }
 
+    fn compile_maximum(
+        &mut self,
+        context: &'c Context,
+        call: &ast::ExprCall,
+    ) -> Result<(Typ, Value<'c, 'a>)> {
+        let ast::Expr::Attribute(attribute) = call.func.as_ref() else {
+            bail!("Only np.maximum calls are supported");
+        };
+        ensure!(
+            attribute.attr.as_str() == "maximum"
+                && matches!(attribute.value.as_ref(), ast::Expr::Name(name) if name.id.as_str() == "np"),
+            "Only np.maximum calls are supported"
+        );
+        ensure!(
+            !self.variables.contains_key("np"),
+            "np.maximum requires an unshadowed np namespace"
+        );
+        ensure!(
+            call.args.len() == 2 && call.keywords.is_empty(),
+            "np.maximum requires exactly two positional arguments and no keywords"
+        );
+        let lhs = self.compile_expr(context, &call.args[0])?;
+        let rhs = self.compile_expr(context, &call.args[1])?;
+        let ty = lhs.0.elementwise_result("maximum", &rhs.0)?;
+        let location = ir::Location::unknown(context);
+        let operation = match &ty {
+            Typ::Tensor {
+                dtype: DType::F32, ..
+            } => self.emit_elementwise(context, &lhs, &rhs, &ty, "arith.maximumf")?,
+            Typ::Fractional => OperationBuilder::new("arith.maximumf", location)
+                .add_operands(&[lhs.1, rhs.1])
+                .add_results(&[Type::float64(context)])
+                .build()?,
+            _ => bail!("np.maximum currently supports float operands only"),
+        };
+        let value = self
+            .block_stack
+            .last()
+            .context("No active block")?
+            .append_operation(operation)
+            .result(0)?
+            .into();
+        Ok((ty, value))
+    }
+
     fn compile_expr(
         &mut self,
         context: &'c Context,
@@ -412,6 +612,45 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         match expr {
             ast::Expr::BinOp(binop) => self.compile_binop(context, binop),
             ast::Expr::Name(name) => self.compile_name(context, name),
+            ast::Expr::Constant(ast::ExprConstant {
+                value: ast::Constant::Float(value),
+                ..
+            }) => {
+                let operation = arith::constant(
+                    context,
+                    FloatAttribute::new(context, Type::float64(context), *value).into(),
+                    ir::Location::unknown(context),
+                );
+                let value = self
+                    .block_stack
+                    .last()
+                    .context("No active block")?
+                    .append_operation(operation)
+                    .result(0)?
+                    .into();
+                Ok((Typ::Fractional, value))
+            }
+            ast::Expr::UnaryOp(expr)
+                if matches!(expr.op, ast::UnaryOp::UAdd | ast::UnaryOp::USub) =>
+            {
+                let (ty, value) = self.compile_expr(context, &expr.operand)?;
+                ensure!(
+                    ty == Typ::Fractional,
+                    "Unary float signs require a float scalar"
+                );
+                if expr.op == ast::UnaryOp::UAdd {
+                    return Ok((ty, value));
+                }
+                let value = self
+                    .block_stack
+                    .last()
+                    .context("No active block")?
+                    .append_operation(arith::negf(value, ir::Location::unknown(context)))
+                    .result(0)?
+                    .into();
+                Ok((ty, value))
+            }
+            ast::Expr::Call(call) => self.compile_maximum(context, call),
             _ => bail!("this expression isn't supported at the moment: {:#?}", expr),
         }
     }
@@ -610,7 +849,7 @@ mod binary_type_tests {
     }
 
     #[test]
-    fn elementwise_ops_require_equal_shapes_and_dtypes() {
+    fn elementwise_ops_broadcast_shapes_and_require_matching_dtypes() {
         for op in [ast::Operator::Add, ast::Operator::Mult] {
             let matrix = tensor(&[3, 2]);
             assert_eq!(matrix.binary_result(op, &matrix).unwrap(), matrix);
@@ -618,12 +857,16 @@ mod binary_type_tests {
                 .binary_result(op, &tensor(&[2, 2]))
                 .unwrap_err()
                 .to_string()
-                .contains("matching shapes"));
-            assert!(matrix
-                .binary_result(op, &tensor(&[2]))
-                .unwrap_err()
-                .to_string()
-                .contains("broadcasting"));
+                .contains("Cannot broadcast"));
+            assert_eq!(matrix.binary_result(op, &tensor(&[2])).unwrap(), matrix);
+            assert_eq!(
+                tensor(&[3, 1]).binary_result(op, &tensor(&[1, 2])).unwrap(),
+                matrix
+            );
+            assert_eq!(
+                tensor(&[0, 2]).binary_result(op, &tensor(&[1, 2])).unwrap(),
+                tensor(&[0, 2])
+            );
             let other_dtype = Typ::Tensor {
                 dtype: DType::F64,
                 shape: vec![3, 2],
@@ -642,7 +885,8 @@ mod binary_type_tests {
                 Typ::Fractional
             );
             assert!(Typ::Integral.binary_result(op, &Typ::Fractional).is_err());
-            assert!(matrix.binary_result(op, &Typ::Fractional).is_err());
+            assert_eq!(matrix.binary_result(op, &Typ::Fractional).unwrap(), matrix);
+            assert_eq!(Typ::Fractional.binary_result(op, &matrix).unwrap(), matrix);
         }
     }
 }

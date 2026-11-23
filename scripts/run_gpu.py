@@ -34,6 +34,8 @@ class Driver:
             "cuCtxCreate_v2": [ct.POINTER(ptr), uint, ct.c_int],
             "cuCtxDestroy_v2": [ptr],
             "cuCtxSynchronize": [],
+            "cuCtxGetCurrent": [ct.POINTER(ptr)],
+            "cuCtxSetCurrent": [ptr],
             "cuModuleLoadData": [ct.POINTER(ptr), ptr],
             "cuModuleGetFunction": [ct.POINTER(ptr), ptr, ct.c_char_p],
             "cuModuleUnload": [ptr],

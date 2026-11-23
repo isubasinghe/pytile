@@ -3,10 +3,10 @@
 PyTile is a Rust learning compiler for a Python subset. It uses RustPython to
 parse Python and Melior to build MLIR, an intermediate representation.
 
-The frontend compiles scalar integer arithmetic, float32 matrix multiplication,
-and matching-shape float32 tensor arithmetic to MLIR. The GPU
-backend converts scalar `i64` functions and standalone `gpu.module` input to
-NVIDIA PTX. Tensor-to-GPU lowering remains an exercise.
+The frontend compiles scalar arithmetic, float32 matrix multiplication,
+broadcast tensor arithmetic, and `np.maximum` to MLIR. The GPU backend converts
+scalar `i64` functions, supported static float32 tensor graphs, and standalone
+`gpu.module` input to NVIDIA PTX.
 
 ## Start
 
@@ -36,7 +36,7 @@ diagnostics without an executable build.
 - [examples/ir_builder.rs](examples/ir_builder.rs) demonstrates Melior builders and MLIR checks.
 - [src/ir.rs](src/ir.rs) creates the MLIR context.
 - [src/main.rs](src/main.rs) runs the frontend, checks MLIR, and writes output.
-- [src/backend.rs](src/backend.rs) converts GPU MLIR to PTX with external tools.
+- [src/backend.rs](src/backend.rs) lowers scalar/tensor functions to GPU MLIR and PTX.
 
 After scalar `square_sum`, use the [matrix scores example](examples/matrix_scores.py)
 below as the next compiler goal.
@@ -108,8 +108,7 @@ these are not probabilities. Run `make matrix-demo` for the NumPy reference:
 Predicted classes: [0, 1, 0]
 ```
 
-The frontend now supports checkpoints 1–3 below. Tensor execution on the GPU
-is the next compiler goal:
+The compiler now supports these checkpoints for static float32 shapes:
 
 1. **Matrix inputs and returns:** represent `float32` arrays as ranked MLIR
    types. Start with an identity function, `return x`, preserving shape `[3, 2]`.
@@ -121,7 +120,8 @@ is the next compiler goal:
    above. This deliberately avoids broadcasting. Verify the emitted MLIR.
 4. **GPU execution:** allocate array and intermediate buffers, lower the matrix
    operations to GPU kernels, and compare the returned scores with NumPy.
-   The existing scalar GPU adapter/runner needs extension for arrays.
+   The tensor backend emits a buffer/launch manifest for `TensorProgram` in
+   `scripts/tensor_runtime.py`.
 
 Compile the example to verified MLIR:
 
@@ -134,14 +134,57 @@ cargo run --locked -- compile examples/matrix_scores.py \
   )' -o build/matrix_scores.mlir
 ```
 
-Keep `argmax` in the reference runner for now. Later goals are a vector bias
-with broadcasting, ReLU, and a second dense layer—the pieces of the MNIST
-forward pass.
+Keep `argmax` in the reference runner for now. Vector bias broadcasting, ReLU,
+and a second dense layer are supported by the MNIST forward target below.
 
 ## MNIST example
 
-[examples/MNIST.md](examples/MNIST.md) describes a NumPy `784 → 32 → 10` network.
+[examples/mnist_forward.py](examples/mnist_forward.py) defines the `784 → 32 → 10`
+network. Compile the full forward pass for a batch of 32:
+
+```sh
+make mnist-compile  # writes build/mnist_forward.mlir
+```
+
+This emits two `linalg.matmul` operations, broadcast bias additions, and ReLU.
+Elementwise operations broadcast trailing dimensions when they match or one is
+size one. Tensor dtypes must match; Python float scalars adopt float32 when used
+with float32 tensors. Standalone Python floats use f64. `np.maximum` supports
+two positional float operands, including scalar thresholds such as `0.0`.
+
+Compile and execute the complete forward pass on an NVIDIA GPU:
+
+```sh
+make mnist-gpu
+```
+
+This regenerates the MLIR, compiles `build/mnist_forward.ptx` and its companion
+`build/mnist_forward.json`, then checks GPU logits against NumPy on five cases.
+The runner uses the existing `forward_fn` interface, including uploads, launches,
+and copying the result back. It checks random, zero, negative-activation, and
+noncontiguous inputs as well as the synthetic dataset batch.
+
+To run an existing artifact, optionally using a local MNIST archive:
+
+```sh
+python3 scripts/run_mnist_gpu.py build/mnist_forward.ptx
+python3 scripts/run_mnist_gpu.py build/mnist_forward.ptx --data build/mnist.npz
+```
+
+Keep the PTX and JSON together; the runtime checks that they match. The manifest
+describes exact input shapes, intermediate buffers, and kernel launch order.
+`TensorProgram` is a reusable callable that takes float32 arrays and returns a
+NumPy array. Input shapes must match the compiled signature. A different batch
+size requires recompilation.
+
+The first tensor backend supports positive static dimensions, standard rank-2
+matrix multiplication, fills, and the frontend's pointwise broadcast operations.
+It launches one kernel per tensor operation (seven for this forward pass), with
+one output element per thread and a serial dot product inside each matmul thread.
+Kernel fusion and tiled matrix multiplication are future optimization work.
+Training remains a CPU reference; these checks use initialized weights and test
+numerical agreement, not trained digit-recognition accuracy.
+
 Run `make mnist-demo` for synthetic data or `make mnist-test` for numerical checks.
-Use `make mnist-forward` for one inference batch. `examples/run_mnist.py` owns
+Use `make mnist-forward` for one NumPy inference batch. `examples/run_mnist.py` owns
 the CLI; data loading and CPU training are separate from the model functions.
-The compiler does not yet lower this network to MLIR.

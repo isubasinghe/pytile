@@ -28,7 +28,7 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
-    /// Lower scalar i64 functions or a GPU MLIR module to sm_75 PTX.
+    /// Lower scalar functions, static float32 tensor functions, or GPU MLIR to sm_75 PTX.
     Ptx {
         source: PathBuf,
         #[arg(short, long, default_value = "build/kernel.ptx")]
