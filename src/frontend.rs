@@ -207,6 +207,10 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
             (Typ::Boolean, ast::Operator::Add) => bail!("adding booleans is not supported"),
             (Typ::Integral, ast::Operator::Add) => arith::addi(lhs.1, rhs.1, location),
             (Typ::Fractional, ast::Operator::Add) => arith::addf(lhs.1, rhs.1, location),
+            (Typ::Unknown, ast::Operator::Mult) => bail!("type was unknown"),
+            (Typ::Boolean, ast::Operator::Mult) => bail!("adding booleans is not supported"),
+            (Typ::Integral, ast::Operator::Mult) => arith::muli(lhs.1, rhs.1, location),
+            (Typ::Fractional, ast::Operator::Mult) => arith::mulf(lhs.1, rhs.1, location),
             (ty, op) => bail!("binary operator {op:?} is not supported for {ty:?}"),
         };
         let block = self.block_stack.last().context("No active block")?;
@@ -310,9 +314,20 @@ impl<'c, 'a> CompileUnit<'c, 'a> {
         Ok(())
     }
 
+    fn compile_stmt_assign(&mut self, context: &'c Context, stmt: &ast::StmtAssign) -> Result<()> {
+        ensure!(stmt.targets.len() == 1, "expected one assignment");
+        let ast::Expr::Name(target) = &stmt.targets[0] else {
+            bail!("Only assignments to names are supported");
+        };
+
+        let (ty, value) = self.compile_expr(context, &stmt.value)?;
+        self.set_variable(target.id.to_string(), ty, value)
+    }
+
     fn compile_stmt(&mut self, context: &'c Context, stmt: &ast::Stmt) -> Result<()> {
         match stmt {
             ast::Stmt::Return(stmt_def) => self.compile_stmtret(context, stmt_def),
+            ast::Stmt::Assign(stmt_assign) => self.compile_stmt_assign(context, stmt_assign),
             _ => bail!("not handled, {:#?}", stmt),
         }
     }
